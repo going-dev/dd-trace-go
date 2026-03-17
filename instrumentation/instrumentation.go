@@ -101,7 +101,6 @@ func ServiceNameWithSource(name string, source string) tracer.StartSpanOption {
 	}
 }
 
-
 // OperationName returns the operation name to be set for the given instrumentation component.
 func (i *Instrumentation) OperationName(component Component, opCtx OperationContext) string {
 	op, ok := i.info.naming[component]
