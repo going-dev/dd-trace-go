@@ -282,7 +282,7 @@ func (p *chainedPropagator) Extract(carrier any) (*SpanContext, error) {
 	pendingBaggage := make(map[string]string) // used to store baggage items temporarily
 
 	for _, v := range p.extractors {
-		firstExtract := (ctx == nil) // ctx stores the most recently extracted ctx across iterations; if it's nil, no extractor has run yet
+		firstExtract := (ctx == nil) // ctx stores the first ctx across iterations; if it's nil, no extraction has run yet
 		extractedCtx, err := v.Extract(carrier)
 
 		// If this is the baggage propagator, just stash its items into pendingBaggage
@@ -307,10 +307,13 @@ func (p *chainedPropagator) Extract(carrier any) (*SpanContext, error) {
 			}
 			ctx = extractedCtx
 		} else { // A local trace context has already been extracted
+			// TODO: See if you can use ctx and extractedCtx here instead.
+			// It was confusing to see this "2" suffix.
 			extractedCtx2 := extractedCtx
 			ctx2 := ctx
 
-			// If we can't cast to spanContext, we can't propgate tracestate or create span links
+			// TODO: Remove, there's no casting.
+			// If we can't cast to spanContext, we can't propagate tracestate or create span links
 			if extractedCtx2.TraceID() == ctx2.TraceID() {
 				if pW3C, ok := v.(*propagatorW3c); ok {
 					pW3C.propagateTracestate(ctx2, extractedCtx2)
@@ -326,6 +329,7 @@ func (p *chainedPropagator) Extract(carrier any) (*SpanContext, error) {
 						overrideDatadogParentID(ctx2, extractedCtx2, ddCtx)
 					}
 				}
+			// TODO: Change this. This should be controlled by `DD_TRACE_PROPAGATION_BEHAVIOR_EXTRACT` 
 			} else if extractedCtx2 != nil { // Trace IDs do not match - create span links
 				link := SpanLink{TraceID: extractedCtx2.TraceIDLower(), SpanID: extractedCtx2.SpanID(), TraceIDHigh: extractedCtx2.TraceIDUpper(), Attributes: map[string]string{"reason": "terminated_context", "context_headers": getPropagatorName(v)}}
 				if trace := extractedCtx2.trace; trace != nil {
