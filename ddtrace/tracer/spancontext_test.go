@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/DataDog/dd-trace-go/v2/ddtrace/ext"
+	"github.com/DataDog/dd-trace-go/v2/internal"
 	"github.com/DataDog/dd-trace-go/v2/internal/globalconfig"
 	"github.com/DataDog/dd-trace-go/v2/internal/log"
 	"github.com/DataDog/dd-trace-go/v2/internal/processtags"
@@ -1101,7 +1102,7 @@ func TestSpanContextIteratorBreak(t *testing.T) {
 
 func BenchmarkBaggageItemPresent(b *testing.B) {
 	ctx := SpanContext{baggage: map[string]string{"key": "value"}, hasBaggage: 1}
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		ctx.ForeachBaggageItem(func(_, _ string) bool {
 			return true
 		})
@@ -1110,7 +1111,7 @@ func BenchmarkBaggageItemPresent(b *testing.B) {
 
 func BenchmarkBaggageItemEmpty(b *testing.B) {
 	ctx := SpanContext{}
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		ctx.ForeachBaggageItem(func(_, _ string) bool {
 			return true
 		})
@@ -1166,15 +1167,22 @@ func TestSetSamplingPriorityLocked(t *testing.T) {
 }
 
 func TestTraceIDHexEncoded(t *testing.T) {
-	tid := traceID([16]byte{})
-	tid[15] = 5
+	var tid traceID
+	tid.value[15] = 5
+	tid.computeAndCacheHex()
 	assert.Equal(t, "00000000000000000000000000000005", tid.HexEncoded())
 }
 
 func TestTraceIDEmpty(t *testing.T) {
-	tid := traceID([16]byte{})
-	tid[15] = 5
-	assert.False(t, tid.Empty())
+	t.Run("empty", func(t *testing.T) {
+		var tid traceID
+		assert.True(t, tid.Empty())
+	})
+	t.Run("not empty", func(t *testing.T) {
+		var tid traceID
+		tid.value[15] = 5
+		assert.False(t, tid.Empty())
+	})
 }
 
 func TestSpanIDHexEncoded(t *testing.T) {
@@ -1250,14 +1258,23 @@ func TestSpanProcessTags(t *testing.T) {
 }
 
 func BenchmarkSpanIDHexEncoded(b *testing.B) {
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		_ = spanIDHexEncoded(32, 16)
 	}
 }
 
 func BenchmarkSpanIDSprintf(b *testing.B) {
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		_ = fmt.Sprintf("%016x", 32)
+	}
+}
+
+func BenchmarkTraceIDHasUpper(b *testing.B) {
+	var tid traceID
+	tid.value[7] = 1
+	b.ResetTimer()
+	for b.Loop() {
+		_ = tid.HasUpper()
 	}
 }
 
@@ -1278,6 +1295,43 @@ func FuzzSpanIDHexEncoded(f *testing.F) {
 		actual := spanIDHexEncoded(v, p)
 		if actual != expected {
 			t.Fatalf("expected %s, got %s", expected, actual)
+		}
+	})
+}
+
+func BenchmarkUpdateTracerGitMetadataTags(b *testing.B) {
+	b.Run("old GetTracerGitMetadataTags", func(b *testing.B) {
+		b.Setenv(internal.EnvGitMetadataEnabledFlag, "true")
+		internal.RefreshGitMetadataTags()
+		updateTags := func(tags map[string]string, key, value string) {
+			if _, ok := tags[key]; !ok && value != "" {
+				tags[key] = value
+			}
+		}
+		// Emulates old implementation of GetTracerGitMetadataTags
+		old := func() map[string]string {
+			results := make(map[string]string)
+			tags := internal.GetGitMetadataTags()
+			updateTags(results, internal.TraceTagRepositoryURL, tags[internal.TagRepositoryURL])
+			updateTags(results, internal.TraceTagCommitSha, tags[internal.TagCommitSha])
+			updateTags(results, internal.TraceTagGoPath, tags[internal.TagGoPath])
+			return results
+		}
+		var sink map[string]string
+		b.ResetTimer()
+		for b.Loop() {
+			sink = old()
+		}
+		// This is to avoid the compiler optimizing out the map allocation.
+		_ = sink
+	})
+	b.Run("new UpdateTracerGitMetadataTags", func(b *testing.B) {
+		b.Setenv(internal.EnvGitMetadataEnabledFlag, "true")
+		internal.RefreshGitMetadataTags()
+		span := newBasicSpan("span")
+		b.ResetTimer()
+		for b.Loop() {
+			updateTracerGitMetadataTags(span)
 		}
 	})
 }

@@ -30,28 +30,40 @@ const TraceIDZero string = "00000000000000000000000000000000"
 
 var _ ddtrace.SpanContext = (*SpanContext)(nil)
 
-type traceID [16]byte // traceID in big endian, i.e. <upper><lower>
-
-var emptyTraceID traceID
+// traceID in big endian, i.e. <upper><lower>
+type traceID struct {
+	value      [16]byte
+	hexEncoded string
+}
 
 func (t *traceID) HexEncoded() string {
-	return hex.EncodeToString(t[:])
+	if t.hexEncoded == "" {
+		t.computeAndCacheHex()
+	}
+	return t.hexEncoded
 }
 
 func (t *traceID) Lower() uint64 {
-	return binary.BigEndian.Uint64(t[8:])
+	return binary.BigEndian.Uint64(t.value[8:])
 }
 
 func (t *traceID) Upper() uint64 {
-	return binary.BigEndian.Uint64(t[:8])
+	return binary.BigEndian.Uint64(t.value[:8])
 }
 
 func (t *traceID) SetLower(i uint64) {
-	binary.BigEndian.PutUint64(t[8:], i)
+	binary.BigEndian.PutUint64(t.value[8:], i)
+	t.hexEncoded = ""
 }
 
 func (t *traceID) SetUpper(i uint64) {
-	binary.BigEndian.PutUint64(t[:8], i)
+	binary.BigEndian.PutUint64(t.value[:8], i)
+	t.hexEncoded = ""
+}
+
+func (t *traceID) set(v [16]byte) {
+	t.value = v
+	t.hexEncoded = ""
 }
 
 func (t *traceID) SetUpperFromHex(s string) error {
@@ -64,20 +76,22 @@ func (t *traceID) SetUpperFromHex(s string) error {
 }
 
 func (t *traceID) Empty() bool {
-	return *t == emptyTraceID
+	return t.value == [16]byte{}
 }
 
 func (t *traceID) HasUpper() bool {
-	for _, b := range t[:8] {
-		if b != 0 {
+	for ix := range t.value[:8] {
+		if t.value[ix] != 0 {
 			return true
 		}
 	}
 	return false
 }
 
-func (t *traceID) UpperHex() string {
-	return hex.EncodeToString(t[:8])
+func (t *traceID) UpperHex() string { return t.HexEncoded()[:16] }
+
+func (t *traceID) computeAndCacheHex() {
+	t.hexEncoded = hex.EncodeToString(t.value[:])
 }
 
 // SpanContext represents a span state that can propagate to descendant spans
@@ -145,7 +159,7 @@ type spanContextV1Adapter interface {
 // to start child spans.
 func FromGenericCtx(c ddtrace.SpanContext) *SpanContext {
 	var sc SpanContext
-	sc.traceID = c.TraceIDBytes()
+	sc.traceID.set(c.TraceIDBytes())
 	sc.spanID = c.SpanID()
 	sc.baggage = make(map[string]string) // +checklocksignore - Initialization time, not shared yet.
 	c.ForeachBaggageItem(func(k, v string) bool {
@@ -192,6 +206,7 @@ func FromGenericCtx(c ddtrace.SpanContext) *SpanContext {
 // baggage and other values from it. This method also pushes the span into the
 // new context's trace and as a result, it should not be called multiple times
 // for the same span.
+// +checklocksignore — Initialization time, context not yet shared.
 func newSpanContext(span *Span, parent *SpanContext) *SpanContext {
 	context := &SpanContext{
 		spanID: span.spanID,
@@ -246,7 +261,7 @@ func (c *SpanContext) SpanID() uint64 {
 
 // TraceID implements ddtrace.SpanContext.
 func (c *SpanContext) TraceID() string {
-	if c == nil {
+	if c == nil || c.traceID.Empty() {
 		return TraceIDZero
 	}
 	return c.traceID.HexEncoded()
@@ -255,9 +270,9 @@ func (c *SpanContext) TraceID() string {
 // TraceIDBytes implements ddtrace.SpanContext.
 func (c *SpanContext) TraceIDBytes() [16]byte {
 	if c == nil {
-		return emptyTraceID
+		return [16]byte{}
 	}
-	return c.traceID
+	return c.traceID.value
 }
 
 // TraceIDLower implements ddtrace.SpanContext.
@@ -526,10 +541,6 @@ func (t *trace) setTagLocked(key, value string) {
 	t.tags[key] = value
 }
 
-func samplerToDM(sampler samplernames.SamplerName) string {
-	return "-" + strconv.Itoa(int(sampler))
-}
-
 // setSamplingPriority sets the sampling priority and the decision maker
 // and returns true if it was modified.
 //
@@ -557,7 +568,7 @@ func (t *trace) setSamplingPriorityLockedWithForce(p int, sampler samplernames.S
 		// the decision maker will be different. So we compare the decision makers as well.
 		// Note that once global rate sampling is deprecated, we no longer need to compare
 		// the DMs. Sampling priority is sufficient to distinguish a change in DM.
-		dm := samplerToDM(sampler)
+		dm := sampler.DecisionMaker()
 		updatedDM := !existed || dm != curDM
 		if updatedDM {
 			t.setPropagatingTagLocked(keyDecisionMaker, dm)
@@ -591,6 +602,7 @@ func (t *trace) setLocked(locked bool) {
 
 // push pushes a new span into the trace. If the buffer is full, it returns
 // a errBufferFull error.
+// +checklocksignore — Reads sp.metrics during initialization; span not yet shared.
 func (t *trace) push(sp *Span) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -620,6 +632,7 @@ func (t *trace) push(sp *Span) {
 // setTraceTagsLocked sets all "trace level" tags on the provided span
 // t must already be locked.
 // +checklocksread:t.mu
+// +checklocks:s.mu
 func (t *trace) setTraceTagsLocked(s *Span) {
 	assert.RWMutexRLocked(&t.mu)
 	assert.RWMutexLocked(&s.mu)
@@ -629,11 +642,23 @@ func (t *trace) setTraceTagsLocked(s *Span) {
 	for k, v := range t.propagatingTags {
 		s.setMetaLocked(k, v)
 	}
-	for k, v := range sharedinternal.GetTracerGitMetadataTags() {
-		s.setMetaLocked(k, v)
-	}
+	updateTracerGitMetadataTags(s)
 	if s.context != nil && s.context.traceID.HasUpper() {
 		s.setMetaLocked(keyTraceID128, s.context.traceID.UpperHex())
+	}
+}
+
+// updateTracerGitMetadataTags updates the tracer git metadata tags on the given span.
+// +checklocks:s.mu
+func updateTracerGitMetadataTags(s *Span) {
+	assert.RWMutexLocked(&s.mu)
+	gitMetadataTags := sharedinternal.GetGitMetadataTags()
+	for ix := range sharedinternal.TracerGitMetadataKeys {
+		pair := sharedinternal.TracerGitMetadataKeys[ix]
+		src, dst := pair[0], pair[1]
+		if v := gitMetadataTags[src]; v != "" {
+			s.setMetaLocked(dst, v)
+		}
 	}
 }
 
@@ -644,7 +669,7 @@ func (t *trace) setTraceTagsLocked(s *Span) {
 //
 // Lock ordering: span.mu -> trace.mu. The caller holds s.mu. This function acquires t.mu.
 // Invariant: The caller MUST hold s.mu.
-// TODO: Add checklocks annotation.
+// +checklocksignore — Caller holds s.mu (cross-struct lock; checklocks can't verify through SpanContext.finish indirection).
 func (t *trace) finishedOneLocked(s *Span) {
 	assert.RWMutexLocked(&s.mu)
 
@@ -774,7 +799,10 @@ func (t *trace) finishedOneLocked(s *Span) {
 
 // setPeerService sets the peer.service, _dd.peer.service.source, and _dd.peer.service.remapped_from
 // tags as applicable for the given span.
+// s.mu must be held for writing.
+// +checklocks:s.mu
 func setPeerService(s *Span, tc TracerConf) {
+	assert.RWMutexLocked(&s.mu)
 	spanKind := s.meta[ext.SpanKind]
 	isOutboundRequest := spanKind == ext.SpanKindClient || spanKind == ext.SpanKindProducer
 
@@ -857,19 +885,27 @@ func deriveAWSPeerService(sm map[string]string) string {
 	return ""
 }
 
+// hasMetaKeyLocked checks if a key exists in the span's meta map.
+// s.mu must be held for reading.
+// +checklocks:s.mu
+func (s *Span) hasMetaKeyLocked(tag string) bool {
+	assert.RWMutexLocked(&s.mu)
+	_, ok := s.meta[tag]
+	return ok
+}
+
 // setPeerServiceFromSource sets peer.service from the sources determined
 // by the tags on the span. It returns the source tag name that it used for
 // the peer.service value, or the empty string if no valid source tag was available.
+// s.mu must be held for writing.
+// +checklocks:s.mu
 func setPeerServiceFromSource(s *Span) string {
-	has := func(tag string) bool {
-		_, ok := s.meta[tag]
-		return ok
-	}
+	assert.RWMutexLocked(&s.mu)
 	var sources []string
 	useTargetHost := true
 	switch {
 	// order of the cases and their sources matters here. These are in priority order (highest to lowest)
-	case has("aws_service"):
+	case s.hasMetaKeyLocked("aws_service"):
 		sources = []string{
 			"queuename",
 			"topicname",
@@ -882,16 +918,16 @@ func setPeerServiceFromSource(s *Span) string {
 			ext.CassandraContactPoints,
 		}
 		useTargetHost = false
-	case has(ext.DBSystem):
+	case s.hasMetaKeyLocked(ext.DBSystem):
 		sources = []string{
 			ext.DBName,
 			ext.DBInstance,
 		}
-	case has(ext.MessagingSystem):
+	case s.hasMetaKeyLocked(ext.MessagingSystem):
 		sources = []string{
 			ext.KafkaBootstrapServers,
 		}
-	case has(ext.RPCSystem):
+	case s.hasMetaKeyLocked(ext.RPCSystem):
 		sources = []string{
 			ext.RPCService,
 		}

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"sync/atomic"
 
 	"github.com/tinylib/msgp/msgp"
@@ -88,8 +89,34 @@ type payloadV1 struct {
 	// buf holds the sequence of msgpack-encoded items.
 	buf []byte
 
+	// st is the persistent string table used across all incremental pushes.
+	// nil until the first push() call.
+	st *stringTable
+
+	// staticBufLen is len(p.buf) after static fields (2–10) have been encoded
+	// on the first push. Informational; not required for correctness.
+	staticBufLen int
+
+	// chunksCountOff is the byte offset within p.buf of the 4-byte chunk-count
+	// field that immediately follows the 0xdd array32 marker for field 11.
+	// Zero means the array32 placeholder has not been written yet.
+	chunksCountOff int
+
 	// reader is used for reading the contents of buf.
 	reader *bytes.Reader
+
+	// chunkAttr is a reusable map for per-push chunk attributes,
+	// avoiding a new map allocation on each push.
+	chunkAttr map[string]anyValue
+
+	// staticEncoded tracks whether static fields (2–10) and the array32
+	// placeholder have been written to buf for this payload cycle.
+	staticEncoded bool
+
+	// processTagsCached holds the cached anyValue for process tags,
+	// avoiding repeated boxing of the string into any.
+	processTagsCached anyValue
+	processTagsStr    string
 }
 
 // newPayloadV1 returns a ready to use payloadV1.
@@ -97,12 +124,29 @@ func newPayloadV1() *payloadV1 {
 	return &payloadV1{
 		attributes: make(map[string]anyValue),
 		chunks:     make([]traceChunk, 0),
-		readOff:    0,
-		writeOff:   0,
+		header:     make([]byte, 0, 8),
+		chunkAttr:  make(map[string]anyValue),
 	}
 }
 
-// push pushes a new item (a traceChunk)into the payload.
+var payloadV1Pool = sync.Pool{
+	New: func() any {
+		return newPayloadV1()
+	},
+}
+
+func getPayloadV1() *payloadV1 {
+	p := payloadV1Pool.Get().(*payloadV1)
+	p.clear()
+	return p
+}
+
+func putPayloadV1(p *payloadV1) {
+	payloadV1Pool.Put(p)
+}
+
+// push pushes a new item (a traceChunk) into the payload.
+// +checklocksignore — Post-finish: reads finished span fields during payload encoding.
 func (p *payloadV1) push(t spanList) (stats payloadStats, err error) {
 	// We need to hydrate the payload with everything we get from the spans.
 	// Conceptually, our `t spanList` corresponds to one `traceChunk`.
@@ -114,7 +158,7 @@ func (p *payloadV1) push(t spanList) (stats payloadStats, err error) {
 	// For now, we blindly set the origin, priority, and attributes values for the chunk
 	// In the future, attributes should hold values that are shared across all chunks in the payload
 	origin, priority, sm, traceID := "", 0, uint32(0), [16]byte{}
-	attr := make(map[string]anyValue)
+	clear(p.chunkAttr)
 	for _, span := range t {
 		if span == nil {
 			continue
@@ -126,8 +170,8 @@ func (p *payloadV1) push(t spanList) (stats payloadStats, err error) {
 
 		// If we haven't seen the service yet, we set it blindly assuming that all the spans created by
 		// a service must share the same value.
-		if _, ok := attr["service"]; !ok {
-			attr["service"] = anyValue{valueType: StringValueType, value: span.Root().service}
+		if _, ok := p.chunkAttr["service"]; !ok {
+			p.chunkAttr["service"] = anyValue{valueType: StringValueType, value: span.Root().service}
 		}
 
 		binary.BigEndian.PutUint64(traceID[:8], span.Context().traceID.Upper())
@@ -162,7 +206,7 @@ func (p *payloadV1) push(t spanList) (stats payloadStats, err error) {
 		origin:            origin,
 		traceID:           traceID[:],
 		samplingMechanism: uint32(sm),
-		attributes:        attr,
+		attributes:        p.chunkAttr,
 	}
 
 	// Append process tags to the payload attributes
@@ -174,8 +218,50 @@ func (p *payloadV1) push(t spanList) (stats payloadStats, err error) {
 		atomic.AddUint32(&p.fields, 1)
 	}
 
+	// First push: encode static fields (2–10) once and write the array32
+	// placeholder for field 11. Subsequent pushes only append new chunk bytes.
+	if !p.staticEncoded {
+		p.staticEncoded = true
+		if p.st == nil {
+			p.st = newStringTable()
+		} else {
+			p.st.reset()
+		}
+		// Pre-size buffer based on estimated span encoding size.
+		if estimatedSize := len(t) * 300; estimatedSize > cap(p.buf) {
+			p.buf = make([]byte, 0, estimatedSize)
+		}
+		p.buf = encodeField(p.buf, p.bm, 2, p.containerID, p.st)
+		p.buf = encodeField(p.buf, p.bm, 3, p.languageName, p.st)
+		p.buf = encodeField(p.buf, p.bm, 4, p.languageVersion, p.st)
+		p.buf = encodeField(p.buf, p.bm, 5, p.tracerVersion, p.st)
+		p.buf = encodeField(p.buf, p.bm, 6, p.runtimeID, p.st)
+		p.buf = encodeField(p.buf, p.bm, 7, p.env, p.st)
+		p.buf = encodeField(p.buf, p.bm, 8, p.hostname, p.st)
+		p.buf = encodeField(p.buf, p.bm, 9, p.appVersion, p.st)
+		p.encodeAttributes(p.bm, 10, p.attributes, p.st)
+		if p.bm.contains(11) {
+			p.buf = msgp.AppendUint32(p.buf, 11)    // field ID for chunks
+			p.buf = append(p.buf, 0xdd, 0, 0, 0, 0) // array32 marker + 4-byte count = 0
+			p.chunksCountOff = len(p.buf) - 4
+		}
+		p.staticBufLen = len(p.buf)
+	}
+
+	// Encode the new chunk immediately while spans are still valid (before any
+	// pool release). This is what makes the incremental model safe with span pooling.
+	if p.bm.contains(11) {
+		p.encodeTraceChunk(tc, p.st)
+	}
+
 	p.chunks = append(p.chunks, tc)
 	p.recordItem()
+
+	// Update the chunk count in the array32 header in-place.
+	if p.chunksCountOff > 0 {
+		binary.BigEndian.PutUint32(p.buf[p.chunksCountOff:], atomic.LoadUint32(&p.count))
+	}
+
 	p.update()
 	return p.stats(), err
 }
@@ -208,8 +294,13 @@ func (p *payloadV1) clear() {
 	p.bm = 0
 	p.buf = p.buf[:0]
 	p.reader = nil
-	p.header = nil
+	// header is pre-allocated; keep backing array, reset length for sentinel check.
+	p.header = p.header[:0]
 	p.readOff = 0
+	p.staticEncoded = false
+	p.staticBufLen = 0
+	p.chunksCountOff = 0
+	p.chunks = p.chunks[:0]
 	atomic.StoreUint32(&p.fields, 0)
 	atomic.StoreUint32(&p.count, 0)
 }
@@ -239,9 +330,7 @@ func (p *payloadV1) protocol() float64 {
 }
 
 func (p *payloadV1) updateHeader() {
-	if len(p.header) == 0 {
-		p.header = make([]byte, 8)
-	}
+	p.header = p.header[:cap(p.header)]
 	n := atomic.LoadUint32(&p.fields)
 	switch {
 	case n <= 15:
@@ -267,10 +356,14 @@ func (p *payloadV1) setProcessTags() {
 	if pTags == "" {
 		return
 	}
-	p.attributes[keyProcessTags] = anyValue{
-		valueType: StringValueType,
-		value:     pTags,
+	if p.processTagsStr != pTags {
+		p.processTagsCached = anyValue{
+			valueType: StringValueType,
+			value:     pTags,
+		}
+		p.processTagsStr = pTags
 	}
+	p.attributes[keyProcessTags] = p.processTagsCached
 }
 
 func (p *payloadV1) Close() error {
@@ -302,11 +395,13 @@ func (p *payloadV1) Read(b []byte) (n int, err error) {
 }
 
 func (p *payloadV1) update() {
-	if len(p.header) == 0 {
-		p.header = make([]byte, 8)
-	}
 	p.updateHeader()
-	// Reset the buffer length to 0 before re-encoding
+	if p.staticEncoded {
+		// Incremental encoding: p.buf has already been populated by push().
+		return
+	}
+	// No pushes yet (static-only payload): encode everything from scratch.
+	// p.chunks is empty at this point so encodeTraceChunks produces nothing.
 	p.buf = p.buf[:0]
 	p.encode()
 }
@@ -384,6 +479,34 @@ func (p *payloadV1) encodeAttributes(bm bitmap, fieldID int, kv map[string]anyVa
 	return true, nil
 }
 
+// encodeTraceChunk encodes a single trace chunk and appends it to p.buf.
+// It is called from push() to perform incremental encoding while the spans
+// are still valid (before any span-pool release).
+func (p *payloadV1) encodeTraceChunk(chunk traceChunk, st *stringTable) {
+	p.buf = msgp.AppendMapHeader(p.buf, 7) // 7 fields per chunk
+
+	// priority
+	p.buf = encodeField(p.buf, fullSetBitmap, 1, chunk.priority, st)
+
+	// origin
+	p.buf = encodeField(p.buf, fullSetBitmap, 2, chunk.origin, st)
+
+	// attributes
+	p.encodeAttributes(fullSetBitmap, 3, chunk.attributes, st)
+
+	// spans
+	p.encodeSpans(fullSetBitmap, 4, chunk.spans, st)
+
+	// droppedTrace
+	p.buf = encodeField(p.buf, fullSetBitmap, 5, chunk.droppedTrace, st)
+
+	// traceID
+	p.buf = encodeField(p.buf, fullSetBitmap, 6, chunk.traceID, st)
+
+	// samplingMechanism
+	p.buf = encodeField(p.buf, fullSetBitmap, 7, chunk.samplingMechanism, st)
+}
+
 // encodeTraceChunks encodes a list of trace chunks associated with fieldID into p.buf in msgp format.
 func (p *payloadV1) encodeTraceChunks(bm bitmap, fieldID int, tc []traceChunk, st *stringTable) (bool, error) {
 	if len(tc) == 0 || !bm.contains(uint32(fieldID)) {
@@ -421,6 +544,7 @@ func (p *payloadV1) encodeTraceChunks(bm bitmap, fieldID int, tc []traceChunk, s
 }
 
 // encodeSpans encodes a list of spans associated with fieldID into p.buf in msgp format.
+// +checklocksignore — Post-finish: reads finished span fields during payload encoding.
 func (p *payloadV1) encodeSpans(bm bitmap, fieldID int, spans spanList, st *stringTable) (bool, error) {
 	if len(spans) == 0 || !bm.contains(uint32(fieldID)) {
 		return false, nil
@@ -429,6 +553,7 @@ func (p *payloadV1) encodeSpans(bm bitmap, fieldID int, spans spanList, st *stri
 	p.buf = msgp.AppendUint32(p.buf, uint32(fieldID))         // msgp key
 	p.buf = msgp.AppendArrayHeader(p.buf, uint32(len(spans))) // number of spans
 
+	var scratch []byte
 	for _, span := range spans {
 		if span == nil {
 			continue
@@ -461,14 +586,15 @@ func (p *payloadV1) encodeSpans(bm bitmap, fieldID int, spans spanList, st *stri
 			p.buf = msgp.AppendFloat64(p.buf, v)
 		}
 		for k, v := range span.metaStruct {
-			msg, err := msgp.AppendIntf(nil, v)
+			var err error
+			scratch, err = msgp.AppendIntf(scratch[:0], v)
 			if err != nil {
 				log.Error("failed to serialize meta_struct value for key %s: %v", k, err.Error())
 				continue
 			}
 			p.buf = st.serialize(k, p.buf)
 			p.buf = msgp.AppendUint32(p.buf, uint32(BytesValueType))
-			p.buf = msgp.AppendBytes(p.buf, msg)
+			p.buf = msgp.AppendBytes(p.buf, scratch)
 		}
 
 		p.buf = encodeField(p.buf, fullSetBitmap, 10, span.spanType, st)
@@ -595,9 +721,10 @@ func (p *payloadV1) encodeSpanEvents(bm bitmap, fieldID int, spanEvents []spanEv
 			case spanEventAttributeTypeArray:
 				p.buf = st.serialize(k, p.buf)
 				p.buf = msgp.AppendUint32(p.buf, uint32(ArrayValueType))
-				p.buf = msgp.AppendArrayHeader(p.buf, uint32(len(v.ArrayValue.Values))*3) // number of attributes
+				// Array format is (type, value) per element; decoder expects len/2 anyValues.
+				p.buf = msgp.AppendArrayHeader(p.buf, uint32(len(v.ArrayValue.Values))*2)
 				for _, v := range v.ArrayValue.Values {
-					p.encodeSpanEventArrayValues(k, v, st)
+					p.encodeSpanEventArrayValues(v, st)
 				}
 			default:
 				log.Warn("dropped unsupported span event attribute type %d", v.Type)
@@ -607,22 +734,18 @@ func (p *payloadV1) encodeSpanEvents(bm bitmap, fieldID int, spanEvents []spanEv
 	return true, nil
 }
 
-func (p *payloadV1) encodeSpanEventArrayValues(k string, v *spanEventArrayAttributeValue, st *stringTable) (bool, error) {
+func (p *payloadV1) encodeSpanEventArrayValues(v *spanEventArrayAttributeValue, st *stringTable) (bool, error) {
 	switch v.Type {
 	case spanEventArrayAttributeValueTypeString:
-		p.buf = st.serialize(k, p.buf)
 		p.buf = msgp.AppendUint32(p.buf, uint32(StringValueType))
 		p.buf = st.serialize(v.StringValue, p.buf)
 	case spanEventArrayAttributeValueTypeInt:
-		p.buf = st.serialize(k, p.buf)
 		p.buf = msgp.AppendUint32(p.buf, uint32(IntValueType))
 		p.buf = msgp.AppendInt64(p.buf, v.IntValue)
 	case spanEventArrayAttributeValueTypeDouble:
-		p.buf = st.serialize(k, p.buf)
 		p.buf = msgp.AppendUint32(p.buf, uint32(FloatValueType))
 		p.buf = msgp.AppendFloat64(p.buf, v.DoubleValue)
 	case spanEventArrayAttributeValueTypeBool:
-		p.buf = st.serialize(k, p.buf)
 		p.buf = msgp.AppendUint32(p.buf, uint32(BoolValueType))
 		p.buf = msgp.AppendBool(p.buf, v.BoolValue)
 	default:
@@ -699,7 +822,6 @@ func (p *payloadV1) decodeBuffer() ([]byte, error) {
 	}
 	p.buf = o
 	atomic.StoreUint32(&p.fields, numFields)
-	p.header = make([]byte, 8)
 	p.updateHeader()
 
 	st := newStringTable()
@@ -892,11 +1014,22 @@ type stringTable struct {
 }
 
 func newStringTable() *stringTable {
-	return &stringTable{
-		strings:   []stringValue{""},
-		indices:   map[stringValue]index{"": 0},
+	st := &stringTable{
+		strings:   make([]stringValue, 1, 64),
+		indices:   make(map[stringValue]index, 64),
 		nextIndex: 1,
 	}
+	st.strings[0] = ""
+	st.indices[""] = 0
+	return st
+}
+
+func (st *stringTable) reset() {
+	clear(st.indices)
+	st.indices[""] = 0
+	st.strings = st.strings[:1]
+	st.strings[0] = ""
+	st.nextIndex = 1
 }
 
 // Adds a string to the string table if it does not already exist.
@@ -1069,6 +1202,7 @@ func decodeSpans(b []byte, st *stringTable) (spanList, []byte, error) {
 
 // decode reads a span from a byte slice and populates the associated fields in the span.
 // This should only be used with decoding v1.0 payloads.
+// +checklocksignore — Initialization time, span being decoded and not yet shared.
 func (span *Span) decode(b []byte, st *stringTable) ([]byte, error) {
 	numFields, o, err := msgp.ReadMapHeaderBytes(b)
 	for range numFields {

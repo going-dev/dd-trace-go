@@ -8,12 +8,15 @@ package tracer
 import (
 	gocontext "context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"runtime/pprof"
 	rt "runtime/trace"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -209,6 +212,11 @@ var statsInterval = 10 * time.Second
 // TODO: The entire Start/Stop code should be refactored, it's pretty gnarly.
 var startStopMu locking.Mutex
 
+// reportInitTime reports the tracer initialization duration as a telemetry metric.
+func reportInitTime(start time.Time) {
+	telemetry.Distribution(telemetry.NamespaceGeneral, "init_time", nil).Submit(float64(time.Since(start).Milliseconds()))
+}
+
 // Start starts the tracer with the given set of options. It will stop and replace
 // any running tracer, meaning that calling it several times will result in a restart
 // of the tracer by replacing the current instance with a new one.
@@ -216,9 +224,7 @@ func Start(opts ...StartOption) error {
 	startStopMu.Lock()
 	defer startStopMu.Unlock()
 
-	defer func(now time.Time) {
-		telemetry.Distribution(telemetry.NamespaceGeneral, "init_time", nil).Submit(float64(time.Since(now).Milliseconds()))
-	}(time.Now())
+	defer reportInitTime(time.Now())
 	t, err := newTracer(opts...)
 	if err != nil {
 		return err
@@ -267,8 +273,10 @@ func Start(opts ...StartOption) error {
 	cfg.Env = t.config.internalConfig.Env()
 	cfg.HTTP = t.config.httpClient
 	cfg.ServiceName = t.config.serviceName
-	if err := t.startRemoteConfig(cfg); err != nil {
-		log.Warn("Remote config startup error: %s", err.Error())
+	if t.config.agent.load().hasRemoteConfig {
+		if err := t.startRemoteConfig(cfg); err != nil {
+			log.Warn("Remote config startup error: %s", err.Error())
+		}
 	}
 
 	// appsec.Start() may use the telemetry client to report activation, so it is
@@ -276,7 +284,7 @@ func Start(opts ...StartOption) error {
 	// client is appropriately configured.
 	appsecopts := make([]appsecConfig.StartOption, 0, len(t.config.appsecStartOptions)+1)
 	appsecopts = append(appsecopts, t.config.appsecStartOptions...)
-	appsecopts = append(appsecopts, appsecConfig.WithRCConfig(cfg), appsecConfig.WithMetaStructAvailable(t.config.agent.metaStructAvailable))
+	appsecopts = append(appsecopts, appsecConfig.WithRCConfig(cfg), appsecConfig.WithMetaStructAvailable(t.config.agent.load().metaStructAvailable))
 
 	appsec.Start(appsecopts...)
 
@@ -467,20 +475,27 @@ func newUnstartedTracer(opts ...StartOption) (t *tracer, err error) {
 		stats:            newConcentrator(c, defaultStatsBucketSize, statsd),
 		spansStarted:     *globalinternal.NewXSyncMapCounterMap(),
 		spansFinished:    *globalinternal.NewXSyncMapCounterMap(),
-		obfuscator: obfuscate.NewObfuscator(obfuscate.Config{
-			SQL: obfuscate.SQLConfig{
-				TableNames:       c.agent.HasFlag("table_names"),
-				ReplaceDigits:    c.agent.HasFlag("quantize_sql_tables") || c.agent.HasFlag("replace_sql_digits"),
-				KeepSQLAlias:     c.agent.HasFlag("keep_sql_alias"),
-				DollarQuotedFunc: c.agent.HasFlag("dollar_quoted_func"),
-			},
-		}),
+		obfuscator: obfuscate.NewObfuscator(func() obfuscate.Config {
+			af := c.agent.load()
+			return obfuscate.Config{
+				SQL: obfuscate.SQLConfig{
+					TableNames:       af.HasFlag("table_names"),
+					ReplaceDigits:    af.HasFlag("quantize_sql_tables") || af.HasFlag("replace_sql_digits"),
+					KeepSQLAlias:     af.HasFlag("keep_sql_alias"),
+					DollarQuotedFunc: af.HasFlag("dollar_quoted_func"),
+				},
+			}
+		}()),
 		statsd:      statsd,
 		dataStreams: dataStreamsProcessor,
 		logFile:     logFile,
 	}
 	return t, nil
 }
+
+// defaultAgentInfoPollInterval is the default interval at which the tracer
+// polls the agent's /info endpoint for capability updates.
+const defaultAgentInfoPollInterval = 5 * time.Second
 
 // newTracer creates a new tracer and starts it.
 // NOTE: This function does NOT set the global tracer, which is required for
@@ -518,7 +533,78 @@ func newTracer(opts ...StartOption) (*tracer, error) {
 		t.reportHealthMetricsAtInterval(statsInterval)
 	})
 	t.stats.Start()
+
+	// Periodically refresh agent capabilities from /info so that config changes
+	// (e.g. peer tags, span events support) take effect without a tracer restart.
+	// Skip when the agent is disabled (lambda / agentless / tracing disabled).
+	if c.agentEnabled() {
+		interval := c.agentInfoPollInterval
+		if interval <= 0 {
+			interval = defaultAgentInfoPollInterval
+		}
+		t.wg.Go(func() { t.pollAgentInfo(interval) })
+	}
+
 	return t, nil
+}
+
+// refreshAgentFeatures fetches a fresh snapshot from /info and atomically
+// updates the dynamic agent capabilities. Static fields that are baked into
+// components at startup (transport URL, statsd address, obfuscator config, etc.)
+// are preserved from the current snapshot so a poll can never change them.
+func (t *tracer) refreshAgentFeatures() {
+	ctx, cancel := gocontext.WithCancel(gocontext.Background())
+	defer cancel()
+	// Goroutine lifetime bounded by defer cancel() above; no wg tracking needed.
+	go func() {
+		select {
+		case <-t.stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	newFeatures, err := fetchAgentFeatures(ctx, t.config.agentURL, t.config.httpClient)
+	if err != nil {
+		if !errors.Is(err, errAgentFeaturesNotSupported) {
+			log.Debug("agent info poll failed: %s", err.Error())
+		}
+		return // keep last-known-good
+	}
+	// Atomically graft the startup-frozen static fields from the current
+	// snapshot onto the fresh dynamic snapshot. update() handles the CAS
+	// loop in case a concurrent store races this write. fn must be a pure
+	// transform — work on a local copy f so retries start fresh.
+	t.config.agent.update(func(current agentFeatures) agentFeatures {
+		// f is a shallow copy of newFeatures. Reference-typed fields (map, slice)
+		// must be overwritten from current or cloned below to avoid shared mutable
+		// backing storage across CAS retries.
+		f := newFeatures
+		f.v1ProtocolAvailable = current.v1ProtocolAvailable
+		f.StatsdPort = current.StatsdPort
+		f.evpProxyV2 = current.evpProxyV2
+		f.metaStructAvailable = current.metaStructAvailable
+		f.featureFlags = maps.Clone(current.featureFlags) // defensive copy of map
+		f.peerTags = slices.Clone(newFeatures.peerTags)   // defensive copy of slice
+		f.defaultEnv = current.defaultEnv
+		f.reachable = current.reachable
+		f.hasTelemetryProxy = current.hasTelemetryProxy
+		return f
+	})
+}
+
+// pollAgentInfo polls the agent /info endpoint at the given interval until the
+// tracer stops. It delegates each refresh to refreshAgentFeatures.
+func (t *tracer) pollAgentInfo(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			t.refreshAgentFeatures()
+		case <-t.stop:
+			return
+		}
+	}
 }
 
 // Flush flushes any buffered traces. Flush is in effect only if a tracer
@@ -656,6 +742,7 @@ func (t *tracer) pushChunk(trace *chunk) {
 	}
 }
 
+// +checklocksignore — Initialization time, span not yet shared.
 func spanStart(operationName string, options ...StartSpanOption) *Span {
 	var opts StartSpanConfig
 	for _, fn := range options {
@@ -672,8 +759,9 @@ func spanStart(operationName string, options ...StartSpanOption) *Span {
 	}
 
 	var (
-		context       *SpanContext
-		parentService string
+		context             *SpanContext
+		parentService       string
+		parentServiceSource string
 		// The default pprof context is taken from the start options and is
 		// not nil when using StartSpanFromContext()
 		pprofContext = opts.Context
@@ -686,6 +774,7 @@ func spanStart(operationName string, options ...StartSpanOption) *Span {
 			// to minimize lock contention on the parent span during child creation.
 			inheritedData := context.span.inheritedData()
 			parentService = inheritedData.service
+			parentServiceSource = inheritedData.serviceSource
 
 			// Inherit the context.Context from parent span if it was propagated
 			// using ChildOf() rather than StartSpanFromContext(), see
@@ -711,13 +800,14 @@ func spanStart(operationName string, options ...StartSpanOption) *Span {
 	}
 	// span defaults
 	span := &Span{
-		name:        operationName,
-		service:     parentService, // inherit from parent if available
-		resource:    operationName,
-		spanID:      id,
-		traceID:     id,
-		start:       startTime,
-		integration: "manual",
+		name:          operationName,
+		service:       parentService, // inherit from parent if available
+		serviceSource: parentServiceSource,
+		resource:      operationName,
+		spanID:        id,
+		traceID:       id,
+		start:         startTime,
+		integration:   "manual",
 	}
 
 	span.spanLinks = append(span.spanLinks, opts.SpanLinks...)
@@ -744,9 +834,7 @@ func spanStart(operationName string, options ...StartSpanOption) *Span {
 	}
 	span.setMetaInit("language", "go")
 	// add tags from options
-	for k, v := range opts.Tags {
-		span.SetTag(k, v)
-	}
+	span.setTags(opts.Tags)
 	isRootSpan := context == nil || context.span == nil
 	if isRootSpan {
 		traceprof.SetProfilerRootTags(span)
@@ -763,6 +851,7 @@ func spanStart(operationName string, options ...StartSpanOption) *Span {
 }
 
 // StartSpan creates, starts, and returns a new Span with the given `operationName`.
+// +checklocksignore — Initialization time, span not yet returned to caller.
 func (t *tracer) StartSpan(operationName string, options ...StartSpanOption) *Span {
 	if !t.config.enabled.get() {
 		return nil
@@ -777,15 +866,14 @@ func (t *tracer) StartSpan(operationName string, options ...StartSpanOption) *Sp
 	if hostname := cfg.Hostname(); hostname != "" && cfg.ReportHostname() {
 		span.setMetaInit(keyHostname, hostname)
 	}
-	span.supportsEvents = t.config.agent.spanEventsAvailable
+	span.supportsEvents = t.config.agent.load().spanEventsAvailable
 
 	// add global tags
-	for k, v := range t.config.globalTags.get() {
-		span.SetTag(k, v)
-	}
+	span.setTags(t.config.globalTags.get())
 
 	if newSvc, ok := cfg.ServiceMapping(span.service); ok {
 		span.service = newSvc
+		span.serviceSource = ext.ServiceSourceMapping
 	}
 
 	if ver := cfg.Version(); ver != "" {
@@ -832,6 +920,7 @@ func (t *tracer) StartSpan(operationName string, options ...StartSpanOption) *Sp
 // endpoint filtering feature to span. When span finishes, any pprof labels
 // found in ctx are restored. Additionally, this func informs the profiler how
 // many times each endpoint is called.
+// +checklocksignore — Initialization time, called from StartSpan before span is shared.
 func (t *tracer) applyPPROFLabels(ctx gocontext.Context, span *Span) {
 	// Important: The label keys are ordered alphabetically to take advantage of
 	// an upstream optimization that landed in go1.24.  This results in ~10%
@@ -868,6 +957,7 @@ func (t *tracer) applyPPROFLabels(ctx gocontext.Context, span *Span) {
 // spanResourcePIISafe returns true if s.resource can be considered to not
 // include PII with reasonable confidence. E.g. SQL queries may contain PII,
 // but http, rpc or custom (s.spanType == "") span resource names generally do not.
+// +checklocksignore — Reads spanType, immutable after initialization.
 func spanResourcePIISafe(s *Span) bool {
 	return s.spanType == ext.SpanTypeWeb || s.spanType == ext.AppTypeRPC || s.spanType == ""
 }
@@ -1050,6 +1140,7 @@ func (t *tracer) sample(span *Span) {
 	t.prioritySampling.apply(span)
 }
 
+// +checklocksignore — Initialization time, called from spanStart before span is shared.
 func startExecutionTracerTask(ctx gocontext.Context, span *Span) (gocontext.Context, func()) {
 	if !rt.IsEnabled() {
 		return ctx, func() {}
